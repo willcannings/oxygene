@@ -1,19 +1,14 @@
+# encoding: ASCII-8BIT
 require 'fileutils'
 require 'concurrent'
 require 'thread'
 
 module Oxygene
-    OPERATIONS = {
-        :set => 1,
-        :add => 2,
-        :delete => 3
-    }
-
     # ------------------------------------
     # database
     # ------------------------------------
     class DB
-        attr_accessor :path
+        attr_accessor :path, :logs
 
         def initialize(path, connection_pool)
             @path = path
@@ -76,12 +71,18 @@ module Oxygene
         def finish
             @available = true
         end
+
+        def transaction
+            Transaction.new(@log)
+        end
     end
 
     # ------------------------------------
     # on disk and in memory indexes
     # ------------------------------------
     class Log
+        attr_reader :file, :valid
+
         def initialize(connection)
             @path  = File.join(connection.db.path, "#{connection.id}.log")
             @lock  = Concurrent::ReadWriteLock.new
@@ -91,12 +92,19 @@ module Oxygene
             connection.db.logs << self
         end
 
+        # on disk operations
         def create_or_load
             if File.exists?(@path)
                 @file = File.open(@path, 'r+b')
+                @size = @file.size
             else
                 @file = File.open(@path, 'w+b')
                 @size = 0
+            end
+
+            while @file.pos < @size
+                transaction = Transaction.from_log(self)
+                merge_transaction(transaction)
             end
 
             @open = true
@@ -114,6 +122,7 @@ module Oxygene
             end
         end
 
+        # mutating the log
         def add(transaction)
             str = transaction.to_s
             str_length = str.length
@@ -126,6 +135,7 @@ module Oxygene
                 begin
                     written = @file.write(str)
                     if written == str_length
+                        merge_transaction(transaction)
                         @size += str_length
                         next true
                     end
@@ -135,6 +145,10 @@ module Oxygene
                 @valid = false
             end
         end
+
+        def merge_transaction(transaction)
+            p transaction.operations
+        end
     end
 
     # ------------------------------------
@@ -142,7 +156,7 @@ module Oxygene
     # ------------------------------------
     class Key
         attr_accessor :table, :row, :column, :qualifier, :timestamp
-        KEY_FORMAT = 'ZQ>ZZQ>'
+        KEY_FORMAT = 'Z*Q>Z*Z*Q>'
 
         def initialize(table, row, column, qualifier = nil, timestamp = nil)
             @table = table
@@ -163,29 +177,120 @@ module Oxygene
         end
     end
 
-    class Transaction
-        def initialize
-            @operations = []
+    class Value
+        attr_reader :value
+        def initialize(value)
+            @value = value
         end
 
-        def set(key, value)
-            @operations << [key, :set, value]
+        def self.from_s(str)
+            Value.new(str)
         end
+    end
 
-        def add(key, value)
-            @operations << [key, :add, value]
-        end
+    class Operation
+        OPERATION_MAGIC  = "\0"
+        OPERATION_HEADER_FORMAT = 'aCL>L>'
+        OPERATION_HEADER_LENGTH = 10 # \x0, C op, L> key length, L> value length
+        OPERATIONS = {
+            :set => 1,
+            :add => 2,
+            :delete => 3,
+            1 => :set,
+            2 => :add,
+            3 => :delete
+        }
 
-        def delete(key)
-            @operations << [key, :delete]
+        attr_reader :key, :op, :value
+
+        def initialize(key, op, value = nil)
+            @key = key
+            @op = op
+            @value = value
         end
 
         def to_s
+            key_data     = @key.to_s
+            key_length   = key_data.length
 
+            unless @value.nil?
+                value_data   = @value.to_s
+                value_length = value_data.length
+            else
+                value_data   = ''
+                value_length = 0
+            end
+
+            header = [OPERATION_MAGIC, OPERATIONS[@op], key_length, value_length]
+            header.pack(OPERATION_HEADER_FORMAT) + key_data + value_data
         end
 
         def self.from_file(file)
-            
+            header = file.read(OPERATION_HEADER_LENGTH)
+            magic, op, key_length, value_length = header.unpack(OPERATION_HEADER_FORMAT)
+            raise 'invalid operation header start byte' unless magic == OPERATION_MAGIC
+
+            key_data = file.read(key_length)
+            key = Key.from_s(key_data)
+
+            if value_length > 0
+                value_data = file.read(value_length)
+                value = Value.from_s(value_data)
+            else
+                value = nil
+            end
+
+            Operation.new(key, OPERATIONS[op], value)
+        end
+    end
+
+    class Transaction
+        attr_reader :log, :operations
+        TRANSACTION_MAGIC  = "\xFF"
+        TRANSACTION_HEADER_FORMAT = 'aL>L>'
+        TRANSACTION_HEADER_LENGTH = 9 # \xFF, L> length, L> count
+
+        def initialize(log, operations = [])
+            @log = log
+            @operations = operations
+        end
+
+        def set(key, value)
+            @operations << Operation.new(key, :set, value)
+        end
+
+        def add(key, value)
+            @operations << Operation.new(key, :add, value)
+        end
+
+        def delete(key)
+            @operations << Operation.new(key, :delete)
+        end
+
+        def commit
+            @log.add(self)
+        end
+
+        def to_s
+            entries = @operations.collect(&:to_s)
+            length = entries.map(&:length).reduce(:+)
+            header = [TRANSACTION_MAGIC, length, entries.count]
+            header.pack(TRANSACTION_HEADER_FORMAT) + entries.join
+        end
+
+        def self.from_log(log)
+            file = log.file
+            header = file.read(TRANSACTION_HEADER_LENGTH)
+            magic, length, count = header.unpack(TRANSACTION_HEADER_FORMAT)
+            raise 'invalid transaction header start byte' unless magic == TRANSACTION_MAGIC
+
+            start_position = file.pos
+            operations = count.times.collect do
+                Operation.from_file(file)
+            end
+
+            raise 'transaction is an invalid length' unless file.pos == start_position + length
+            Transaction.new(log, operations)
         end
     end
 end
